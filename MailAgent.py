@@ -12,6 +12,8 @@ from flask import Flask, request, jsonify
 from google import genai
 from google.genai import types
 from datetime import datetime, timedelta, timezone
+from ValidationAgent import run_agent as run_validation_agent
+from SharedExcelLock import excel_lock
 
 load_dotenv()
 
@@ -20,6 +22,7 @@ API_KEY    = os.getenv("GEMINI_API_KEY")
 MODEL      = os.getenv("GEMINI_MODEL")
 
 #Excels
+
 EXCELS_FOLDER    = os.getenv("EXCELS_FOLDER", "Excels")
 EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".xlsb", ".csv"}
 os.makedirs(os.path.join(EXCELS_FOLDER, "Maintenance"), exist_ok=True)
@@ -125,137 +128,187 @@ def get_latest_excel(folder):
 
 
 def build_master_excel(default_impl_status="Pending"):
-    folders = ["Maintenance", "Rescheduled", "ImplementationStatus"]
+    folders  = ["Maintenance", "Rescheduled", "ImplementationStatus"]
     priority = {"Maintenance": 1, "Rescheduled": 2, "ImplementationStatus": 3}
     dfs = []
-
+ 
+    master_path = os.path.join(EXCELS_FOLDER, "master_patch_data.xlsx")
+ 
+    # ── Preserve ValidationAgent columns before rebuilding ────────────────────
+    preserved_cols = ["Boot Time", "Application Team Validation Status"]
+    preserved_data = {}
+    if os.path.exists(master_path):
+        try:
+            existing_df = pd.read_excel(master_path)
+            existing_df.columns = existing_df.columns.str.strip()
+            cols_to_save = ["Server Name"] + [c for c in preserved_cols if c in existing_df.columns]
+            if len(cols_to_save) > 1:
+                preserved_data = existing_df[cols_to_save].set_index("Server Name").to_dict(orient="index")
+        except Exception as e:
+            print(f"Could not preserve validation columns: {e}")
+ 
     for folder in folders:
         folder_path = os.path.join(EXCELS_FOLDER, folder)
         latest_file = get_latest_excel(folder_path)
         if not latest_file:
             continue
-
         try:
-            df = pd.read_excel(latest_file) if latest_file.suffix.lower() != ".csv" else pd.read_csv(latest_file)
-            df.columns = df.columns.str.strip()  
+            df = (
+                pd.read_excel(latest_file)
+                if latest_file.suffix.lower() != ".csv"
+                else pd.read_csv(latest_file)
+            )
+            df.columns      = df.columns.str.strip()
             df["Source_Folder"] = folder
-            df["Source_File"] = latest_file.name
+            df["Source_File"]   = latest_file.name
+            df["Source_Mtime"]  = latest_file.stat().st_mtime
             dfs.append(df)
         except Exception as e:
             print(f"Error reading {latest_file}: {e}")
-
+ 
     if not dfs:
         print("No Excel files found.")
         return None
-
-    
+ 
+    required_cols = ["Server Name", "Application Name", "Patch Window",
+                     "Reboot Required", "Implementation Status"]
+    for df in dfs:
+        for col in required_cols:
+            if col not in df.columns:
+                df[col] = None
+ 
     master_df = pd.concat(dfs, ignore_index=True)
-
-    for col in ["Server Name", "Application Name", "Patch Window", "Reboot Required", "Implementation Status"]:
-        if col not in master_df.columns:
-            master_df[col] = None
-
+ 
+    # ImplementationStatus (priority=3) is source of truth → keep="last"
     master_df["priority"] = master_df["Source_Folder"].map(priority)
-    master_df = master_df.sort_values(by="priority")
+    master_df = master_df.sort_values(
+        by=["priority", "Source_Mtime"],
+        ascending=[True, True]          # lowest priority first → keep="last" wins highest
+    )
     master_df = master_df.drop_duplicates(subset=["Server Name"], keep="last")
-
+ 
     master_df["Implementation Status"] = master_df["Implementation Status"].fillna(default_impl_status)
-
-
-    master_path = os.path.join(EXCELS_FOLDER, "master_patch_data.xlsx")
-    master_df.to_excel(master_path, index=False)
+ 
+    # Drop internal helper columns
+    master_df = master_df.drop(columns=["priority", "Source_Mtime"], errors="ignore")
+ 
+    # ── Patch preserved ValidationAgent columns back in ───────────────────────
+    if preserved_data:
+        for col in preserved_cols:
+            master_df[col] = master_df["Server Name"].map(
+                lambda s: preserved_data.get(s, {}).get(col)
+            )
+ 
+    with excel_lock:
+        master_df.to_excel(master_path, index=False)
     print(f"Master Excel updated: {master_path}")
-
+ 
     return master_df
 
 def get_latest_mail(folder_name: str = "") -> str:
     """
     Fetch the most recent email from the monitored mail folder.
     Returns subject, sender, body preview, and any saved Excel attachments.
+    If the subject is 'Implementation Status', also triggers the Validation Agent.
     """
     target_folder = folder_name or FOLDER_NAME
-
+ 
     # Resolve folder ID
     folder_url = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/childFolders"
-    folders = requests.get(folder_url, headers=get_headers()).json()
-    folder_id = None
+    folders    = requests.get(folder_url, headers=get_headers()).json()
+    folder_id  = None
     for f in folders.get("value", []):
         if f["displayName"] == target_folder:
             folder_id = f["id"]
-
+ 
     if not folder_id:
         return json.dumps({"error": f"Folder '{target_folder}' not found."})
-
+ 
     # Fetch latest message
     msgs_url = (
         f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder_id}/messages"
         f"?$top=1&$orderby=receivedDateTime desc"
     )
     msgs = requests.get(msgs_url, headers=get_headers()).json()
-
+ 
     if not msgs.get("value"):
         return json.dumps({"error": "No messages found in folder."})
-
-    mail = msgs["value"][0]
+ 
+    mail       = msgs["value"][0]
     message_id = mail["id"]
-    subject    = mail.get("subject")
+    subject    = mail.get("subject", "")
     sender     = mail["from"]["emailAddress"]["address"]
     body       = mail.get("bodyPreview")
     received   = mail.get("receivedDateTime")
-
-   
+ 
     attachments_saved = []
-
-    if 'Maintenance Notification' in subject or 'Reschedule Maintenance' in subject or 'Implementation Status' in subject:
+    is_impl_status    = "Implementation Status" in subject
+ 
+    if (
+        "Maintenance Notification" in subject
+        or "Reschedule Maintenance"  in subject
+        or is_impl_status
+    ):
         if mail.get("hasAttachments"):
-
-            attach_url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/attachments"
+            attach_url      = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/attachments"
             attach_response = requests.get(attach_url, headers=get_headers()).json()
-
+ 
             for att in attach_response.get("value", []):
-
                 file_name = att["name"]
-                ext = Path(file_name).suffix.lower()
-
+                ext       = Path(file_name).suffix.lower()
+ 
                 if ext not in EXCEL_EXTENSIONS:
                     continue
-
-                # Decide folder + fixed filename
-                if 'Maintenance Notification' in subject:
-                    folder = os.path.join(EXCELS_FOLDER, "Maintenance")
+ 
+                if "Maintenance Notification" in subject:
+                    folder    = os.path.join(EXCELS_FOLDER, "Maintenance")
                     save_path = os.path.join(folder, "maintenance_latest.xlsx")
-
-                elif 'Reschedule Maintenance' in subject:
-                    folder = os.path.join(EXCELS_FOLDER, "Rescheduled")
+ 
+                elif "Reschedule Maintenance" in subject:
+                    folder    = os.path.join(EXCELS_FOLDER, "Rescheduled")
                     save_path = os.path.join(folder, "rescheduled_latest.xlsx")
-
-                elif 'Implementation Status' in subject:
-                    folder = os.path.join(EXCELS_FOLDER, "ImplementationStatus")
+ 
+                elif is_impl_status:
+                    folder    = os.path.join(EXCELS_FOLDER, "ImplementationStatus")
                     save_path = os.path.join(folder, "implementation_latest.xlsx")
-
+ 
                 else:
                     continue
-
+ 
                 os.makedirs(folder, exist_ok=True)
-
                 file_data = base64.b64decode(att["contentBytes"])
-
                 with open(save_path, "wb") as f:
                     f.write(file_data)
-
+ 
                 attachments_saved.append(save_path)
-
-                print(f"  [Mail Tool] Saved (latest overwrite): {save_path}")
-
+                print(f"  [Mail Tool] Saved: {save_path}")
+ 
     if attachments_saved:
         build_master_excel()
+        if is_impl_status:
+            print("\n[Mail Tool] Implementation Status mail — starting Validation Agent...")
+            threading.Thread(
+                target=run_validation_agent,
+                args=(
+                    "Get all lyric servers where Implementation Status is Completed, "
+                    "connect to each via WinRM to fetch the boot time, save it to Excel, "
+                    "then validate if it's within the patch window and update the "
+                    "Application Team Validation Status for every server.",
+                ),
+                kwargs={"silent": True},
+                daemon=True,
+            ).start()
+        else:
+            print(f"\n[Mail Tool] '{subject}' mail processed — validation agent not triggered.")
+ 
     return json.dumps({
-        "message_id":   message_id,
-        "subject":      subject,
-        "from":         sender,
-        "received":     received,
-        "body_preview": body,
+        "message_id":        message_id,
+        "subject":           subject,
+        "from":              sender,
+        "received":          received,
+        "body_preview":      body,
         "attachments_saved": attachments_saved,
+        "validation_triggered": is_impl_status and bool(attachments_saved),
     })
 
 
@@ -570,7 +623,7 @@ def run_predefined(prompt_key: str, silent: bool = False) -> str:
 flask_app = Flask(__name__)
 
 
-processed_messages = set()
+processed_messages = {} 
 
 @flask_app.route("/webhook", methods=["GET", "POST"])
 def webhook():
@@ -596,24 +649,31 @@ def webhook():
                 print(f"[Webhook] Skipping duplicate message: {message_id}")
                 continue
 
-            processed_messages.add(message_id)
+            processed_messages[message_id] = message_id 
 
             print(f"[Webhook] New mail notification received: {message_id}")
             
             
-            result = run_agent(
-                "A new mail notification from patching team just arrived. "
-                "Check if the subject contains 'Maintenance Notification', "
-                "'Reschedule Maintenance', or 'Implementation Status'. "
-                "Download any attached Excel, extract only lyric servers, "
-                "and return their details and attachment info.",
-                silent=False
-            )
-
-            print(f"\n[Agent Auto-Response]\n{result}")
+            threading.Thread(
+            target=_process_notification,
+            args=(message_id,),
+            daemon=True
+            ).start()
 
         return jsonify({"status": "ok"}), 200
 
+def _process_notification(message_id: str):
+    result = run_agent(
+        "A new mail notification from the patching team just arrived. "
+        "Fetch the latest email and check if the subject contains "
+        "'Maintenance Notification', 'Reschedule Maintenance', or 'Implementation Status'. "
+        "Download any attached Excel and save it to the correct folder. "
+        "Return the subject, attachment info, and lyric server details. "
+        "Note: if the subject contains 'Implementation Status', the Validation Agent "
+        "will be triggered automatically — you do not need to do anything extra.",
+        silent=True, 
+    )
+    print(f"\n[Agent Auto-Response]\n{result}")
 
 def setup_subscription():
     import time
