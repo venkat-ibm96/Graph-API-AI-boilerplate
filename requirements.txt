@@ -1,0 +1,8 @@
+python-dotenv==1.0.1
+msal==1.31.1
+requests==2.32.3
+pandas==2.2.3
+openpyxl==3.1.5
+groq==0.13.1
+flask==3.1.0
+apscheduler==3.10.4
