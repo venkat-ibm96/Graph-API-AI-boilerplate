@@ -5,3 +5,6 @@ response.json
 
 folder_ids.txt
 details.txt
+
+__pycache__/
+*.pyc
