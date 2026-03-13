@@ -9,3 +9,4 @@ details.txt
 __pycache__/
 *.pyc
 Excels/
+.vscode
