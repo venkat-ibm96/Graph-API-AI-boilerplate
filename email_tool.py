@@ -23,6 +23,7 @@ Sections:
 
 from __future__ import annotations
 
+import hashlib
 import base64
 import json
 import logging
@@ -38,6 +39,7 @@ from dotenv import load_dotenv
 
 from auth import get_headers
 
+from validation_agent import run_agent as run_validation_agent
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -68,6 +70,26 @@ for _sub in _SUBFOLDER_PRIORITY:
 
 # Threading lock — prevents concurrent writes to the master Excel
 _excel_lock: threading.Lock = threading.Lock()
+
+
+# Content-based mail dedup
+# ---------------------------------------------------------------------------
+ 
+# In-memory set — prevents duplicate Graph notifications (same physical email,
+# different message_id) from being processed more than once per process lifetime.
+# On restart this resets, but Graph's retry window (~4 hrs) makes that low-risk
+# for a stable server. Add disk persistence if restarts are frequent.
+_processed_mail_hashes: set[str] = set()
+_mail_hash_lock: threading.Lock  = threading.Lock()
+
+def _make_mail_hash(subject: str, received: str, sender: str) -> str:
+    """
+    Stable content fingerprint for a mail, independent of Graph's message_id.
+    Graph can assign different message_ids to the same physical email across
+    duplicate notifications — this hash collapses them to one identity.
+    """
+    raw = f"{subject}|{received}|{sender}".lower().strip()
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 
@@ -139,7 +161,7 @@ def build_master_excel(default_impl_status: str = "Pending") -> pd.DataFrame | N
     # Deduplicate: keep the row with the highest priority
     master_df.sort_values("_priority", inplace=True)
     master_df.drop_duplicates(subset=["Server Name"], keep="last", inplace=True)
-    master_df["Implementation Status"].fillna(default_impl_status, inplace=True)
+    master_df["Implementation Status"] = master_df["Implementation Status"].fillna(default_impl_status)
 
     # Drop internal helper columns before saving
     master_df.drop(columns=["_priority"], inplace=True)
@@ -183,7 +205,7 @@ def load_excel() -> pd.DataFrame | None:
         return None
 
 
-def delete_stale_files(days: int = 7) -> int:
+def delete_stale_files(days: int = 14) -> int:
     """
     Delete files older than *days* from the Excels folder (non-recursive).
 
@@ -454,6 +476,36 @@ def _save_attachment(att: dict, subject: str) -> str | None:
         logger.error("Failed to save attachment '%s': %s", file_name, exc)
         return None
 
+# def _run_validation_safe(query: str):
+#     try:
+#         run_validation_agent(query)
+#     except Exception as exc:
+#         logger.error("[Validation Thread] Agent failed: %s", exc, exc_info=True)
+
+_validation_lock: threading.Lock = threading.Lock()
+_validation_pending: threading.Event = threading.Event()
+
+def _run_validation_safe(query: str) -> None:
+    _validation_pending.set()   # signal that a run is wanted
+
+    acquired = _validation_lock.acquire(blocking=False)
+    if not acquired:
+        logger.info("[Validation Thread] Queued — will run after current finishes.")
+        return
+
+    try:
+        while _validation_pending.is_set():
+            _validation_pending.clear()   # consume the pending signal
+            logger.info("[Validation Thread] Starting validation agent...")
+            try:
+                run_validation_agent(query)
+            except Exception as exc:
+                logger.error("[Validation Thread] Agent failed: %s", exc, exc_info=True)
+            # if another mail arrived during the run, _validation_pending will be set again
+            # and the while loop runs once more before releasing the lock
+    finally:
+        _validation_lock.release()
+        logger.info("[Validation Thread] Validation agent finished.")
 
 def get_latest_mail(folder_name: str = "") -> str:
     """
@@ -494,6 +546,28 @@ def get_latest_mail(folder_name: str = "") -> str:
         body       = mail.get("bodyPreview", "")
         received   = mail.get("receivedDateTime", "")
 
+        mail_hash = _make_mail_hash(subject, received, sender)
+        with _mail_hash_lock:
+            if mail_hash in _processed_mail_hashes:
+                logger.info(
+                    "Duplicate mail content detected (subject='%s', received='%s') "
+                    "— skipping processing.",
+                    subject, received,
+                )
+                # Return a consistent shape so the agent doesn't get confused
+                # by a missing 'attachments_saved' key
+                return json.dumps({
+                    "message_id":        message_id,
+                    "subject":           subject,
+                    "from":              sender,
+                    "received":          received,
+                    "body_preview":      "",
+                    "attachments_saved": [],
+                    "skipped":           True,
+                    "reason":            "Duplicate mail content already processed.",
+                })
+            _processed_mail_hashes.add(mail_hash)
+
         attachments_saved: list[str] = []
 
         # Download attachments only when subject matches a known category
@@ -517,7 +591,38 @@ def get_latest_mail(folder_name: str = "") -> str:
         # Rebuild master only if we actually saved something
         if attachments_saved:
             build_master_excel()
+            if "Implementation Status" in subject:
+                logger.info("[Mail Tool] Implementation Status mail arrived-starting Validation Agent...")
+                threading.Thread(
+                target=_run_validation_safe,
+                args=(
+                    "Get all lyric servers where Implementation Status is Completed, "
+                    "connect to each via WinRM to fetch the boot time/errors, save it to Excel, "
+                    "then validate if the boot time(if there) is within the patch window and update the "
+                    "Application Team Validation Status for every server.",
+                ),
+                daemon=True,
+            ).start()
 
+                # Return early — tell the email agent its job is done for this mail type.
+                # No summary, no further tool calls needed — validation agent owns this.
+                return json.dumps({
+                    "message_id":        message_id,
+                    "subject":           subject,
+                    "from":              sender,
+                    "received":          received,
+                    "body_preview":      body,
+                    "attachments_saved": attachments_saved,
+                    "delegated":         True,
+                    "message":           (
+                        "Implementation Status mail received. Excel attachment saved and master "
+                        "rebuilt. Validation Agent has been triggered to fetch boot times and "
+                        "validate all completed Lyric servers. No further action required from "
+                        "the email agent."
+                    ),
+                })
+            else:
+                logger.info(f"[Mail Tool] '{subject}' mail processed — validation agent not triggered.")
         return json.dumps({
             "message_id":        message_id,
             "subject":           subject,
