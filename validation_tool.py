@@ -203,10 +203,25 @@ def get_server_boot_time(server_name: str) -> str:
     using  (Get-Date) - (gcim Win32_OperatingSystem).LastBootUpTime
     Returns the boot time as an ISO-8601 string.
     """
-    return json.dumps({"server": server_name, "boot_time": "2026-03-12 15:42:05"})
+     # simulate condition
+    connection_success = False  # change to False to simulate failure
+
+    if connection_success:
+        return json.dumps({
+            "server": server_name,
+            "boot_time": "2026-03-12 15:42:05",
+            "error": None
+        })
+    else:
+        return json.dumps({
+            "server": server_name,
+            "boot_time": None,
+            "error": "Could not connect to server"
+        })
+    # return json.dumps({"server": server_name, "boot_time": "2026-03-12 15:42:05"})
 
 
-def update_boot_time_in_excel(server_name: str, boot_time: str) -> str:
+def update_boot_time_in_excel(server_name: str,boot_time: str = None, error: str = None) -> str:
     """
     Write *boot_time* into the 'Boot Time' column for *server_name*
     in the master Excel file.  Creates the column if it doesn't exist.
@@ -220,6 +235,9 @@ def update_boot_time_in_excel(server_name: str, boot_time: str) -> str:
 
         if "Boot Time" not in df.columns:
             df["Boot Time"] = None
+        
+        if "Error" not in df.columns:
+            df["Error"] = None
 
         mask = (
             df["Server Name"].astype(str).str.strip().str.lower()
@@ -230,6 +248,8 @@ def update_boot_time_in_excel(server_name: str, boot_time: str) -> str:
             return json.dumps({"error": f"Server '{server_name}' not found in Excel."})
 
         df.loc[mask, "Boot Time"] = boot_time
+        df.loc[mask, "Error"] = error
+
         with _excel_lock:
             df.to_excel(MASTER_PATH, index=False)
 
@@ -237,6 +257,7 @@ def update_boot_time_in_excel(server_name: str, boot_time: str) -> str:
             "status":    "updated",
             "server":    server_name,
             "boot_time": boot_time,
+            "error": error
         })
     except Exception as e:
         return json.dumps({"error": str(e)})
@@ -378,29 +399,30 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "update_boot_time_in_excel",
-            "description": (
-                "Write a server's boot time into the 'Boot Time' column of the "
-                "master Excel file. Creates the column if it doesn't exist."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "server_name": {
-                        "type":        "string",
-                        "description": "Exact server name as it appears in the Excel.",
-                    },
-                    "boot_time": {
-                        "type":        "string",
-                        "description": "Boot time string, e.g. '2025-06-14 23:45:00'.",
-                    },
+    "type": "function",
+    "function": {
+        "name": "update_boot_time_in_excel",
+        "description": "Write boot time and/or error into Excel. Creates 'Boot Time' and 'Error' columns if missing.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "server_name": {
+                    "type": "string",
+                    "description": "Exact server name in Excel."
                 },
-                "required": ["server_name", "boot_time"],
+                "boot_time": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "description": "Boot time string e.g. '2026-03-12 15:42:05', or null if unavailable."
+                },
+                "error": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "description": "Error message if boot time could not be fetched, or null if successful."
+                }
             },
-        },
-    },
+            "required": ["server_name"]  # only server_name is required
+        }
+    }
+},
     {
         "type": "function",
         "function": {

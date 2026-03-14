@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -27,6 +28,7 @@ from validation_tool import TOOL_FUNCTIONS, TOOL_SCHEMAS, MASTER_PATH, WINRM_USE
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+TOOL_CALL_DELAY_SECONDS: int = int(os.environ.get("TOOL_CALL_DELAY", "1"))
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -49,10 +51,13 @@ SYSTEM_PROMPT: str = (
     "3. Write the boot time into the master Excel ('Boot Time' column).\n"
     "4. Validate whether the boot time falls within the server's Patch Window.\n"
     "5. Update 'Application Team Validation Status' as 'Successful' or 'Failed'.\n\n"
-    "Always use the provided tools — never guess server data. "
-    "Process servers one by one. Be concise and professional."
+    "Always use the provided tools — never guess server data.\n"
+    "Process servers STRICTLY one at a time in this exact sequence for each server:\n"
+    "  get_server_boot_time → update_boot_time_in_excel → validate_boot_within_patch_window\n"
+    "Complete all three steps for one server before moving to the next.\n"
+    "Do NOT batch multiple servers in a single tool-call round.\n"
+    "Be concise and professional."
 )
-
 # ---------------------------------------------------------------------------
 # Predefined prompts
 # ---------------------------------------------------------------------------
@@ -157,6 +162,7 @@ def run_agent(user_query: str, stream: bool = True) -> str:
     ]
 
     while True:
+        time.sleep(1.5) 
         response = _groq_client.chat.completions.create(
             model                 = GPT_MODEL,
             messages              = messages,
@@ -207,12 +213,15 @@ def run_agent(user_query: str, stream: bool = True) -> str:
                 "tool_call_id": tc.id,
                 "content":      result,
             })
+            time.sleep(TOOL_CALL_DELAY_SECONDS)
 
     # ---- Final response ----------------------------------------------------
     if stream:
         final_stream = _groq_client.chat.completions.create(
             model                 = GPT_MODEL,
             messages              = messages,
+            tools                 = TOOL_SCHEMAS,
+            tool_choice           = "auto",   
             temperature           = 1,
             max_completion_tokens = 8192,
             top_p                 = 1,
@@ -225,6 +234,8 @@ def run_agent(user_query: str, stream: bool = True) -> str:
     final_response = _groq_client.chat.completions.create(
         model                 = GPT_MODEL,
         messages              = messages,
+        tools                 = TOOL_SCHEMAS,
+        tool_choice           = "auto",   
         temperature           = 1,
         max_completion_tokens = 8192,
         top_p                 = 1,
