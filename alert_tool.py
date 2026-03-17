@@ -155,8 +155,11 @@ def _parse_patch_window_end(
                 return None
 
             target_weekday = day_map[day_name]
-            days_diff      = (ref.weekday() - target_weekday) % 7
-            window_date    = ref - timedelta(days=days_diff)
+            boot_weekday   = ref.weekday()
+            days_diff = (target_weekday - boot_weekday) % 7
+            # if days_diff == 0:
+            #     days_diff = 7
+            window_date = ref + timedelta(days=days_diff)
 
             start = window_date.replace(
                 hour=int(start_str[:2]), minute=int(start_str[3:]),

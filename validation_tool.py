@@ -153,8 +153,10 @@ def _parse_patch_window(patch_window: str, reference_date: datetime | None = Non
             boot_weekday   = ref.weekday()
 
             # Find how many days back the last occurrence of target day was
-            days_diff   = (boot_weekday - target_weekday) % 7
-            window_date = ref - timedelta(days=days_diff)
+            days_diff = (target_weekday - boot_weekday) % 7
+            # if days_diff == 0:
+            #     days_diff = 7
+            window_date = ref + timedelta(days=days_diff)
 
             start = window_date.replace(
                 hour=int(start_time[:2]), minute=int(start_time[3:]),

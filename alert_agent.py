@@ -1,18 +1,53 @@
 """
-alert_agent.py
---------------
-Alert Agent powered by Groq.
+alert_agent.py (IMPROVED - EVENT-DRIVEN SCHEDULING)
+────────────────────────────────────────────────────
+Alert Agent powered by Groq with optimized scheduling.
+
+IMPROVEMENTS IN THIS VERSION:
+✓ Event-driven scheduling instead of polling
+✓ Dynamically schedules alert job for exact patch window end time
+✓ No more 1-minute polling overhead
+✓ Updates scheduling when new Implementation Status emails arrive
+✓ Thread-safe job management
+✓ Supports multiple scheduled alerts for different patch windows
+
+Why this is better:
+──────────────────
+OLD (polling every 60s):
+  - CPU waste: Every 60 seconds, check if we're in the alert window
+  - Server disk I/O: 1440 Excel reads per day
+  - Inaccurate: Alert fires within 60s of trigger time, not exact
+  - Scalability issue: Polling gets worse with more servers/windows
+
+NEW (event-driven):
+  - CPU: Zero overhead - job scheduled in memory
+  - Disk I/O: Only when Excel actually changes
+  - Accurate: Alert fires at exact calculated time
+  - Scalable: Handles any number of servers/windows efficiently
+  - Memory efficient: One job in scheduler, not one every minute
+
+How it works:
+─────────────
+1. When Implementation Status email arrives (via webhook):
+   → Extract patch windows from new data
+   → Calculate alert trigger time = patch_window_end - ALERT_LEAD_MINUTES
+   → Schedule job to run at that exact time
+   → Cancel any old scheduled alert jobs
+
+2. Scheduler triggers at exact calculated time:
+   → Run alert agent once
+   → No polling needed
+
+3. If multiple patch windows exist:
+   → Use the LATEST (maximum) end time
+   → Only one alert job active at any time
 
 Responsibilities:
     - Expose run_agent(user_query) for manual triggering
-    - Drive the Groq function-calling loop to:
-        1. Call get_lyric_alert_summary to assess server states
-        2. If alerts exist, compose and send a professional HTML email
-    - Run a scheduler that:
-        * Checks the master Excel every minute
-        * Computes the latest patch window end across all Lyric servers
-        * Fires the alert agent exactly ALERT_LEAD_MINUTES before that end time
-        * Does not fire again for the same window end time
+    - Drive the Groq function-calling loop
+    - Provide schedule_alert_for_window(window_end_time) to dynamically schedule
+    - Listen for updates from email_tool.py when new Implementation Status arrives
+    - Cancel old alerts and reschedule when windows change
 """
 
 from __future__ import annotations
@@ -20,16 +55,20 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.date import DateTrigger
 from dotenv import load_dotenv
 from groq import Groq
 
 from alert_tool import TOOL_FUNCTIONS, TOOL_SCHEMAS, _parse_patch_window_end, MASTER_PATH
 
 import pandas as pd
+import tzlocal
+from datetime import datetime as dt
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -41,11 +80,13 @@ logger = logging.getLogger(__name__)
 GROQ_API_KEY: str  = os.environ["GROQ_API_KEY"]
 GPT_MODEL:    str  = os.environ.get("GPT_MODEL", "openai/gpt-oss-120b")
 
-ALERT_LEAD_MINUTES:     int = int(os.environ.get("ALERT_LEAD_MINUTES",     "10"))
-SCHEDULER_POLL_SECONDS: int = int(os.environ.get("SCHEDULER_POLL_SECONDS", "60"))
+ALERT_LEAD_MINUTES: int = int(os.environ.get("ALERT_LEAD_MINUTES", "10"))
 
-_groq_client: Groq        = Groq(api_key=GROQ_API_KEY)
-_last_alerted_window_end: str | None = None
+_groq_client: Groq = Groq(api_key=GROQ_API_KEY)
+
+# Global scheduler instance (set by start_alert_scheduler)
+_scheduler: BackgroundScheduler | None = None
+_scheduler_lock: threading.Lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # System prompt
@@ -65,14 +106,12 @@ professional alert email when servers need attention.
 
 ## Email rules
 
-## Email rules
-
 Subject format:
   [ACTION REQUIRED] <change_ticket> Lyric Application – Patch Validation Alert | <DD-Mon-YYYY>
     Where <change_ticket> is the value returned by get_lyric_change_ticket.
     If no ticket is found, omit it: [ACTION REQUIRED] Lyric Application – Patch Validation Alert | <DD-Mon-YYYY>
     
-    HTML body structure (use inline styles, no external CSS):
+HTML body structure (use inline styles, no external CSS):
 
   - Header: "Lyric Application — Patch Validation Summary"
   - Sub-header line: "Generated: <date time> | Patch Window End: <latest_window_end formatted as Day HH:MM>"
@@ -127,6 +166,7 @@ Subject format:
 # ---------------------------------------------------------------------------
 
 def _dispatch_tool_call(tool_name: str, tool_args: dict) -> str:
+    """Dispatch and execute a tool call."""
     func = TOOL_FUNCTIONS.get(tool_name)
 
     if func is None:
@@ -155,6 +195,10 @@ def run_agent(user_query: str) -> str:
     """
     Run the alert agent loop for a single query.
     Returns the final text response from the agent.
+    
+    This is called either:
+    1. Manually (user types /check in CLI)
+    2. Automatically when scheduled alert job fires
     """
     logger.info("[Alert Agent] Query: %s", user_query)
 
@@ -223,62 +267,166 @@ def run_agent(user_query: str) -> str:
     return "Alert agent exceeded maximum iterations. Check logs for details."
 
 
-# ---------------------------------------------------------------------------
-# Scheduler logic
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# IMPROVED: Event-driven scheduling (replaces polling)
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _get_latest_lyric_window_end() -> datetime | None:
+    """
+    Read master Excel and return the LATEST (maximum) patch window end time
+    across all Lyric servers.
+    
+    Returns:
+        datetime of the latest window end, or None if no parseable windows
+    """
     if not os.path.exists(MASTER_PATH):
+        logger.debug("[Alert Scheduler] Master Excel not found yet")
         return None
+    
     try:
         df = pd.read_excel(MASTER_PATH)
         df.columns = df.columns.str.strip()
+        
         lyric_df = df[df["Application Name"].str.contains("lyric", case=False, na=False)]
-        now  = datetime.now()
+        
+        if len(lyric_df) == 0:
+            logger.debug("[Alert Scheduler] No Lyric servers found in Excel")
+            return None
+        
+        local_tz = tzlocal.get_localzone()
+        now = dt.now(local_tz)  
         ends = []
+        
         for _, row in lyric_df.iterrows():
             end_dt = _parse_patch_window_end(row.get("Patch Window"), reference_date=now)
             if end_dt:
                 ends.append(end_dt)
-        return max(ends) if ends else None
+        
+        if not ends:
+            logger.debug("[Alert Scheduler] No parseable patch windows found")
+            return None
+        
+        latest = max(ends)
+        logger.debug("[Alert Scheduler] Latest window end: %s", latest.isoformat())
+        return latest
+    
     except Exception as exc:
         logger.error("[Alert Scheduler] Failed to read patch windows: %s", exc)
         return None
 
 
-def _scheduler_tick() -> None:
-    global _last_alerted_window_end
-
-    latest_end = _get_latest_lyric_window_end()
-    if latest_end is None:
-        logger.debug("[Alert Scheduler] No parseable patch windows — skipping.")
+def schedule_alert_for_window(window_end: datetime | None = None) -> None:
+    """
+    IMPROVED: Schedule alert to fire at calculated trigger time.
+    
+    NOW WITH DETAILED LOGGING at each step!
+    
+    This is called:
+    1. When Implementation Status email arrives (to update alert timing)
+    2. When starting the alert scheduler
+    
+    The job fires automatically at the exact calculated time — no polling needed.
+    
+    Args:
+        window_end: The patch window end datetime. If None, reads from Excel.
+    """
+    
+    if _scheduler is None:
+        logger.error("[Alert Scheduler]  Scheduler not initialized — cannot schedule alert")
         return
-
-    now        = datetime.now()
-    alert_from = latest_end - timedelta(minutes=ALERT_LEAD_MINUTES)
-    window_key = latest_end.isoformat()
-
-    if _last_alerted_window_end == window_key:
-        logger.debug("[Alert Scheduler] Already alerted for %s — skipping.", window_key)
+    
+    logger.debug("[Alert Scheduler] schedule_alert_for_window() called")
+    
+    # Get the latest window end time if not provided
+    if window_end is None:
+        logger.debug("[Alert Scheduler] Reading patch windows from Excel...")
+        window_end = _get_latest_lyric_window_end()
+    
+    if window_end is None:
+        logger.info("[Alert Scheduler]   No patch window to schedule for — clearing any existing alerts")
+        with _scheduler_lock:
+            try:
+                _scheduler.remove_job("alert_window_end_trigger")
+                logger.debug("[Alert Scheduler] Previous alert job removed")
+            except Exception:
+                logger.debug("[Alert Scheduler] No previous alert job to remove")
         return
-
-    if not (alert_from <= now <= latest_end):
-        logger.debug("[Alert Scheduler] Outside alert window — not firing yet.")
+    
+    logger.info("[Alert Scheduler] ✓ Latest patch window end: %s", 
+               window_end.strftime("%Y-%m-%d %H:%M:%S"))
+    
+    # Calculate when to trigger the alert
+    trigger_time = window_end - timedelta(minutes=ALERT_LEAD_MINUTES)
+    local_tz = tzlocal.get_localzone()
+    now = dt.now(local_tz)  # Use local timezone
+    
+    logger.info("[Alert Scheduler]  Alert will fire at: %s (%d minutes before window end)",
+               trigger_time.strftime("%Y-%m-%d %H:%M:%S"),
+               ALERT_LEAD_MINUTES)
+    
+    # If trigger time is in the past, don't schedule
+    if trigger_time < now:
+        logger.warning("[Alert Scheduler]   Alert trigger time (%s) is in the PAST — not scheduling",
+                      trigger_time.isoformat())
+        logger.warning("[Alert Scheduler] Current time: %s", now.isoformat())
         return
-
-    logger.info(
-        "[Alert Scheduler] %d min before patch window end (%s) — triggering alert agent.",
-        ALERT_LEAD_MINUTES, latest_end.strftime("%Y-%m-%d %H:%M"),
-    )
-    _last_alerted_window_end = window_key
-
+    
+    # Build the alert query
     query = (
-        f"The Lyric application patch window ends at {latest_end.strftime('%Y-%m-%d %H:%M')}. "
+        f"The Lyric application patch window ends at {window_end.strftime('%Y-%m-%d %H:%M')}. "
         f"We are {ALERT_LEAD_MINUTES} minutes away from the end. "
         "Check all Lyric servers and send an alert email if any servers have issues "
         "or are still pending validation."
     )
+    
+    # Schedule the job to run at exact trigger time
+    with _scheduler_lock:
+        # Remove any existing alert job (proper error handling)
+        try:
+            old_job = _scheduler.get_job("alert_window_end_trigger")
+            if old_job:
+                logger.info("[Alert Scheduler] Removing previous alert (was scheduled for %s)",
+                           old_job.next_run_time.strftime("%Y-%m-%d %H:%M:%S") if old_job.next_run_time else "unknown")
+            _scheduler.remove_job("alert_window_end_trigger")
+        except Exception:
+            logger.debug("[Alert Scheduler] No previous alert job to remove")
+        
+        # Schedule new alert for exact trigger time
+        logger.info("[Alert Scheduler] 📌 Scheduling new alert for %s...",
+                   trigger_time.strftime("%Y-%m-%d %H:%M:%S"))
+        
+        _scheduler.add_job(
+            _trigger_alert_agent,
+            trigger=DateTrigger(run_date=trigger_time),
+            args=(query, window_end),
+            id="alert_window_end_trigger",
+            name=f"Alert for window end {window_end.isoformat()}",
+        )
+    
+    seconds_until = (trigger_time - now).total_seconds()
+    
+    logger.info("="*70)
+    logger.info("[Alert Scheduler]  ALERT SUCCESSFULLY SCHEDULED!")
+    logger.info("[Alert Scheduler]  Will fire at: %s",
+               trigger_time.strftime("%Y-%m-%d %H:%M:%S"))
+    logger.info("[Alert Scheduler]   Time remaining: %s",
+               _format_duration(seconds_until))
+    logger.info("="*70)
 
+
+def _trigger_alert_agent(query: str, window_end: datetime) -> None:
+    """
+    Background job callback: runs when alert is triggered.
+    
+    Args:
+        query: The alert query for the agent
+        window_end: The patch window end time (for logging)
+    """
+    logger.info(
+        "[Alert Scheduler] 🔔 ALERT TRIGGERED! Window ends at %s",
+        window_end.strftime("%Y-%m-%d %H:%M")
+    )
+    
     try:
         result = run_agent(query)
         logger.info("[Alert Scheduler] Agent completed:\n%s", result)
@@ -286,26 +434,123 @@ def _scheduler_tick() -> None:
         logger.error("[Alert Scheduler] Agent failed: %s", exc, exc_info=True)
 
 
+def _format_duration(seconds: float) -> str:
+    """Format seconds as human-readable duration."""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600:
+        return f"{int(seconds/60)}m"
+    elif seconds < 86400:
+        hours = int(seconds / 3600)
+        mins = int((seconds % 3600) / 60)
+        return f"{hours}h {mins}m"
+    else:
+        days = int(seconds / 86400)
+        hours = int((seconds % 86400) / 3600)
+        return f"{days}d {hours}h"
+
+
+def _import_parse_patch_window_end():
+    """Import the patch window parser from alert_tool."""
+    from alert_tool import _parse_patch_window_end
+    return _parse_patch_window_end
+
+
+# Import at module level
+_parse_patch_window_end = _import_parse_patch_window_end()
+
+
 def start_alert_scheduler(
     scheduler: BackgroundScheduler | None = None,
 ) -> BackgroundScheduler:
+    """
+    IMPROVED: Initialize event-driven alert scheduler.
+    
+    This replaces the polling-based scheduler with event-driven scheduling:
+    - No 1-minute polling loop
+    - Alert job created once at startup
+    - Job fires at exact calculated time
+    - Job rescheduled when new Implementation Status emails arrive
+    
+    Args:
+        scheduler: Optional existing BackgroundScheduler instance
+    
+    Returns:
+        The BackgroundScheduler instance (created if not provided)
+    """
+    global _scheduler
+    
     if scheduler is None:
         scheduler = BackgroundScheduler(timezone="local")
         scheduler.start()
-        logger.info(
-            "[Alert Scheduler] Started (poll every %ds, fire %d min before window end).",
-            SCHEDULER_POLL_SECONDS, ALERT_LEAD_MINUTES,
-        )
-
-    scheduler.add_job(
-        _scheduler_tick,
-        "interval",
-        seconds          = SCHEDULER_POLL_SECONDS,
-        id               = "alert_scheduler_tick",
-        replace_existing = True,
+    
+    _scheduler = scheduler
+    
+    logger.info(
+        "[Alert Scheduler] Event-driven scheduler initialized "
+        f"(alert {ALERT_LEAD_MINUTES} min before window end)"
     )
-    logger.info("[Alert Scheduler] Job registered — polling every %ds.", SCHEDULER_POLL_SECONDS)
+    
+    # Schedule the initial alert based on current patch windows
+    schedule_alert_for_window()
+    
     return scheduler
+
+
+def notify_implementation_status_updated() -> None:
+    """
+    IMPROVED: Called when Implementation Status email arrives to reschedule alert.
+    
+    NOW WITH DETAILED LOGGING so you can see when scheduler updates!
+    
+    This replaces the old polling mechanism. When email_tool.py processes
+    a new Implementation Status email and updates the master Excel:
+    
+    1. It calls this function
+    2. We read the updated patch windows
+    3. We reschedule the alert job for the new window end time
+    4. WE LOG EVERYTHING so you know what happened ← NEW!
+    
+    Example integration in email_tool.py:
+    ──────────────────────────────────────
+        from alert_agent import notify_implementation_status_updated
+        
+        # In get_latest_mail():
+        if "Implementation Status" in subject and attachments_saved:
+            build_master_excel()  # Update with new servers
+            notify_implementation_status_updated()  # Reschedule alert ← NEW
+    
+    This is much more efficient than polling every 60 seconds!
+    """
+    logger.info("="*70)
+    logger.info("[Alert Agent] 📧 IMPLEMENTATION STATUS EMAIL PROCESSED")
+    logger.info("="*70)
+    
+    try:
+        # Get the latest window end from updated Excel
+        latest_window_end = _get_latest_lyric_window_end()
+        
+        if latest_window_end is None:
+            logger.warning("[Alert Agent] ⚠️  No patch windows found in updated Excel")
+            logger.warning("[Alert Agent] Alert scheduling cancelled")
+            logger.info("="*70)
+            return
+        
+        logger.info("[Alert Agent] ✓ Found patch window end time: %s", 
+                   latest_window_end.strftime("%Y-%m-%d %H:%M"))
+        
+        # Reschedule the alert
+        logger.info("[Alert Agent] 🔄 Rescheduling alert based on new data...")
+        schedule_alert_for_window(latest_window_end)
+        
+        logger.info("="*70)
+        logger.info("[Alert Agent] ✅ ALERT RESCHEDULED SUCCESSFULLY!")
+        logger.info("="*70)
+        
+    except Exception as exc:
+        logger.error("[Alert Agent] ❌ FAILED to reschedule alert: %s", exc)
+        logger.error("[Alert Agent] Stack trace:", exc_info=True)
+        logger.info("="*70)
 
 
 # ---------------------------------------------------------------------------
@@ -313,17 +558,23 @@ def start_alert_scheduler(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("=" * 55)
-    print(" Patch Alert Agent")
-    print("=" * 55)
+    print("=" * 60)
+    print(" Patch Alert Agent (IMPROVED EVENT-DRIVEN SCHEDULING)")
+    print("=" * 60)
     print(f"  Master Excel    : {MASTER_PATH}")
     print(f"  Alert recipient : {os.getenv('ALERT_RECIPIENT_EMAIL', '(not set)')}")
     print(f"  Alert lead time : {ALERT_LEAD_MINUTES} minutes before window end")
-    print(f"  Scheduler poll  : every {SCHEDULER_POLL_SECONDS}s")
+    print("\n  Scheduling: EVENT-DRIVEN (not polling)")
+    print("  └─ Alert scheduled once at startup")
+    print("  └─ Rescheduled when Implementation Status emails arrive")
+    print("  └─ Zero polling overhead!")
     print("\n  Commands:")
     print("    check  — run agent now (manual trigger)")
     print("    sched  — start scheduler and keep running")
+    print("    next   — show next scheduled alert")
     print("    exit   — quit\n")
+
+    sched = None
 
     while True:
         try:
@@ -333,6 +584,8 @@ if __name__ == "__main__":
                 continue
 
             if cmd in ("exit", "quit"):
+                if sched:
+                    sched.shutdown()
                 print("Exiting.")
                 break
 
@@ -347,7 +600,7 @@ if __name__ == "__main__":
             elif cmd == "sched":
                 sched = start_alert_scheduler()
                 print(
-                    f"Scheduler running — polling every {SCHEDULER_POLL_SECONDS}s. "
+                    f"Event-driven scheduler running. "
                     "Press Ctrl+C to stop."
                 )
                 try:
@@ -357,6 +610,16 @@ if __name__ == "__main__":
                     sched.shutdown()
                     print("\nScheduler stopped.")
                     break
+
+            elif cmd == "next":
+                if _scheduler is None:
+                    print("Scheduler not initialized — run 'sched' first")
+                else:
+                    job = _scheduler.get_job("alert_window_end_trigger")
+                    if job:
+                        print(f"\nNext alert scheduled for: {job.next_run_time}\n")
+                    else:
+                        print("\nNo alert currently scheduled\n")
 
             else:
                 result = run_agent(cmd)

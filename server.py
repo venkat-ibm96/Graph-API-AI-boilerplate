@@ -1,17 +1,32 @@
 """
-
 Flask webhook server for Microsoft Graph API change notifications.
+(IMPROVED - EVENT-DRIVEN ALERT SCHEDULING)
 
 Responsibilities:
     - Receive and validate Graph API webhook POST notifications
     - Deduplicate notifications using a persisted processed-IDs file
     - Trigger the agent automatically when a new patching email arrives
     - Manage the Graph subscription lifecycle (create + periodic renewal)
+    - IMPROVED: Reschedule alert when Implementation Status emails arrive
+
+IMPROVEMENT: Instead of polling every 60 seconds, we now:
+─────────────────────────────────────────────────────────────────
+1. When Implementation Status email arrives → Update master Excel
+2. Immediately call notify_implementation_status_updated()
+3. Alert scheduler reschedules based on new patch windows
+4. Alert fires at exact calculated time — no polling!
+
+Benefits:
+✓ Zero polling overhead
+✓ Accurate alert timing (fires at exact time, not within 60s window)
+✓ CPU efficient - no background polling thread
+✓ Disk efficient - only read Excel when it changes
+✓ Scalable - works with any number of servers/windows
 
 Run:
     python server.py
 
-The webhook must be reachable from the internet (e.g. via ngrok).
+The webhook must be reachable from the internet (e.g via ngrok).
 Set WEBHOOK_URL in .env to the public URL of this server's /webhook endpoint.
 """
 
@@ -32,8 +47,9 @@ from flask import Flask, jsonify, request
 
 from auth import get_headers
 from email_agent import run_agent
-from alert_agent import start_alert_scheduler
-
+from alert_agent import start_alert_scheduler, notify_implementation_status_updated
+from pytz import timezone as pytz_timezone
+import tzlocal
 
 load_dotenv()
 
@@ -145,32 +161,16 @@ def _get_message_subject(message_id: str) -> str:
         return ""
 
 
-# def _handle_new_mail_notification(message_id: str) -> None:
-#     """
-#     Background task: run the agent in response to a new mail notification.
-
-#     Args:
-#         message_id: Graph API message ID (used only for logging here;
-#                     the agent fetches the full email via get_latest_mail).
-#     """
-#     logger.info("Processing notification for message: %s", message_id)
-
-#     query = (
-#         "A new patching email just arrived. "
-#         "Fetch the latest email and check if its subject contains "
-#         "'Maintenance Notification', 'Reschedule Maintenance', or 'Implementation Status'. "
-#         "If it does, download any Excel attachments and summarise the Lyric servers "
-#         "found in the updated data, including their patch windows and reboot requirements."
-#     )
-
-#     try:
-#         result = run_agent(query, stream=False)
-#         logger.info("\n[Agent Auto-Response]\n%s", result)
-#     except Exception as exc:
-#         logger.error("Agent failed while handling notification %s: %s", message_id, exc)
-
-
 def _handle_new_mail_notification(message_id: str) -> None:
+    """
+    Background task: run the agent in response to a new mail notification.
+    
+    IMPROVED: Also reschedule alert if this is an Implementation Status email.
+
+    Args:
+        message_id: Graph API message ID (used only for logging here;
+                    the agent fetches the full email via get_latest_mail).
+    """
     logger.info("Processing notification for message: %s", message_id)
 
     subject = _get_message_subject(message_id)
@@ -205,11 +205,21 @@ def _handle_new_mail_notification(message_id: str) -> None:
     try:
         result = run_agent(query, stream=False)
         logger.info("\n[Agent Auto-Response]\n%s", result)
+        
+        # ─────────────────────────────────────────────────────────────────
+        # IMPROVED: Reschedule alert when Implementation Status email arrives
+        # ─────────────────────────────────────────────────────────────────
+        if "Implementation Status" in subject:
+            logger.info("[Webhook] Implementation Status processed — rescheduling alert...")
+            try:
+                notify_implementation_status_updated()
+            except Exception as exc:
+                logger.error("[Webhook] Failed to reschedule alert: %s", exc)
+        
     except Exception as exc:
         logger.error(
             "Agent failed while handling notification %s: %s", message_id, exc
         )
-
 
 
 def _get_folder_id() -> str | None:
@@ -332,19 +342,27 @@ def renew_subscription() -> None:
         logger.error("renew_subscription failed: %s", exc)
 
 
-
-
 if __name__ == "__main__":
     os.makedirs(EXCELS_FOLDER, exist_ok=True)
+    
+    # Get system's local timezone
+    local_tz = tzlocal.get_localzone()
+    
+    scheduler = BackgroundScheduler(timezone=local_tz)
+    scheduler.start()
+    
+    logger.info(f"[Server] Using local timezone")
+    
+    start_alert_scheduler(scheduler=scheduler)
+
+    logger.info("[Server] Event-driven alert scheduler initialized (no polling)")
+    
+    # Schedule subscription renewal every 12 hours
+    scheduler.add_job(renew_subscription, "interval", hours=12, id="renew_sub")
+    logger.info("[Server] Subscription renewal scheduled (every 12 hours)")
+    
     # Start subscription setup in background so Flask binds first
     threading.Thread(target=setup_subscription, daemon=True).start()
-
-    # Schedule periodic subscription renewal every 12 hours
-    scheduler = BackgroundScheduler(timezone="UTC")
-    scheduler.add_job(renew_subscription, "interval", hours=12, id="renew_sub")
-    start_alert_scheduler(scheduler=scheduler)
-    scheduler.start()
-    logger.info("Subscription renewal scheduler started (every 12 hours).")
 
     logger.info("Starting Flask webhook server on port 5000…")
     flask_app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
