@@ -208,6 +208,24 @@ def run_agent(user_query: str, stream: bool = True) -> str:
 
             result = _dispatch_tool_call(tc.function.name, args)
 
+        # for tc in tool_calls:
+        #     try:
+        #         arg_str = tc.function.arguments or "{}"
+        #         if isinstance(arg_str, str):
+        #             arg_str = arg_str.strip()
+        #             if not arg_str:
+        #                 arg_str = "{}"
+        #         args = json.loads(arg_str)
+        #         if not isinstance(args, dict):
+        #             args = {}
+        #         args = {k: v for k, v in args.items() if isinstance(k, str) and k.strip()}
+        #     except json.JSONDecodeError as e:
+        #         logger.warning("Failed to parse arguments for %s: %s", 
+        #                     tc.function.name, tc.function.arguments)
+        #         args = {}
+
+        #     result = _dispatch_tool_call(tc.function.name, args)
+
             messages.append({
                 "role":         "tool",
                 "tool_call_id": tc.id,
