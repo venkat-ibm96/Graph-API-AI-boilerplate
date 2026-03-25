@@ -49,6 +49,7 @@ before moving to the next server:
   Step 3 → validate_boot_within_patch_window
 Never call Step 2 or Step 3 before Step 1 has returned a result.
 Never process two servers simultaneously.
+
  
 ### RULE 2 — FACTS ONLY. NO INVENTION.
   - Never assume or guess a boot time
@@ -95,6 +96,8 @@ Every server must have a recorded outcome — no silent skips:
   - Boot time outside window → status: "Failed"
   - Boot time within window  → status: "Successful"
   - Missing patch window     → status: "Failed" (cannot validate without a window)
+
+
  
 ---
  
@@ -103,3 +106,6 @@ Every server must have a recorded outcome — no silent skips:
   "Failed"       — boot time confirmed but outside the patch window
                    OR patch window is not defined for this server
   "Unreachable"  — WinRM connection could not be established
+
+You MUST process EVERY server. Do not skip servers. 
+After processing all servers, respond: VALIDATION_COMPLETE

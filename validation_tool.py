@@ -225,6 +225,7 @@ def get_lyric_servers_ready_for_validation() -> str:
     Return only lyric servers where Implementation Status is 'Completed'.
     These are the only servers that should have boot time fetched and validated.
     """
+    time.sleep(3)
     if not os.path.exists(MASTER_PATH):
         return json.dumps({"error": f"Master Excel not found at {MASTER_PATH}"})
 
@@ -252,7 +253,7 @@ def get_lyric_servers_ready_for_validation() -> str:
         })
     except Exception as e:
         return json.dumps({"error": str(e)})
-
+    
 
 # def get_server_boot_time(server_name: str) -> str:
 #     """
@@ -443,6 +444,7 @@ def update_boot_time_in_excel(
     caller should clear the cell first, or the orchestrator should pre-clear it
     before processing a newer mail for the same server.
     """
+    time.sleep(3)
     if not os.path.exists(MASTER_PATH):
         return json.dumps({"error": f"Master Excel not found at {MASTER_PATH}"})
 
@@ -525,6 +527,7 @@ def validate_boot_within_patch_window(server_name: str) -> str:
     * If the server is not found → return an error (no row is added here because
       validation depends on a Patch Window that only a pre-existing row can have).
     """
+    time.sleep(3)
     if not os.path.exists(MASTER_PATH):
         return json.dumps({"error": f"Master Excel not found at {MASTER_PATH}"})
 
