@@ -1767,7 +1767,7 @@ def get_latest_mail(folder_name: str = "") -> str:
                     target=_run_validation_safe,
                     args=(
                         "Get all lyric servers where Implementation Status is Completed, "
-                        "connect to each via WinRM to fetch the boot time/errors, save it to Excel, "
+                        "connect to all servers via WinRM to fetch the boot time/errors, save it to Excel, "
                         "then validate if the boot time (if present) is within the patch window and "
                         "update the Application Team Validation Status for every server.",
                     ),

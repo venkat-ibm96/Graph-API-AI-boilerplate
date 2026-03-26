@@ -255,281 +255,343 @@ def get_lyric_servers_ready_for_validation() -> str:
         return json.dumps({"error": str(e)})
     
 
-# def get_server_boot_time(server_name: str) -> str:
+# def get_server_boot_time(server_names: list[str]) -> str:
 #     """
 #     Connect to *server_name* via WinRM and retrieve the last boot time.
-#     Simulates random success/failure per server call.
+    
+#     Args:
+#         server_name: Hostname or IP address of the Windows server
+    
+#     Returns:
+#         JSON string with server, boot_time, and error fields
+#         Format: {"server": "...", "boot_time": "YYYY-MM-DD HH:MM:SS", "error": null/str}
+    
+#     Reads WinRM credentials from environment variables:
+#         - WINRM_USER
+#         - WINRM_PASSWORD
+#         - WINRM_TRANSPORT (default: ntlm)
 #     """
-#     connection_success = random.choice([True, False])
-
-#     if connection_success:
+    
+#     try:
+#         time.sleep(5)
+#         for server_name in server_names:
+#             if not WINRM_USER or not WINRM_PASSWORD:
+#                 logger.error(f"{server_name}: WINRM_USER or WINRM_PASSWORD not set in environment")
+#                 return json.dumps({
+#                     "server": server_name,
+#                     "boot_time": None,
+#                     "error": "WinRM credentials not configured (WINRM_USER, WINRM_PASSWORD)",
+#                 })
+            
+#             logger.info(f"Connecting to {server_name}...")
+#             if "cranckb" in server_name:
+#                 # Create WinRM session using winrm.Session
+#                 session = winrm.Session(
+#                     server_name,
+#                     auth=(WINRM_USER, WINRM_PASSWORD),
+#                     transport=WINRM_TRANSPORT,
+#                 )
+#             else:
+#                 session = winrm.Session(
+#                     server_name,
+#                     auth=("azure-server\\subhayan", WINRM_PASSWORD),
+#                     transport=WINRM_TRANSPORT,
+#                 )
+            
+#             # Run PowerShell command to get boot time and computer name
+#             ps_cmd = (
+#                 "(Get-CimInstance -ClassName Win32_OperatingSystem | "
+#                 "ForEach-Object { $_.CSName + ' ' + $_.LastBootUpTime })"
+#             )
+            
+#             response = session.run_ps(ps_cmd)
+            
+#             # Check for command execution errors
+#             if response.status_code != 0:
+#                 error_msg = response.std_err.decode("utf-8", errors="ignore").strip()
+#                 if not error_msg:
+#                     error_msg = "Unknown error"
+#                 logger.warning(f"PowerShell error on {server_name}: {error_msg}")
+#                 return json.dumps({
+#                     "server": server_name,
+#                     "boot_time": None,
+#                     "error": f"PowerShell command failed: {error_msg}",
+#                 })
+            
+#             # Parse output: format is "COMPUTERNAME 3/12/2026 3:42:05 PM"
+#             output = response.std_out.decode("utf-8", errors="ignore").strip()
+            
+#             if not output:
+#                 logger.warning(f"{server_name}: No output from PowerShell command")
+#                 return json.dumps({
+#                     "server": server_name,
+#                     "boot_time": None,
+#                     "error": "No output from PowerShell command",
+#                 })
+            
+#             # Split output: first part is computer name, rest is the datetime
+#             parts = output.split(maxsplit=1)
+#             if len(parts) < 2:
+#                 logger.warning(f"{server_name}: Invalid output format: {output}")
+#                 return json.dumps({
+#                     "server": server_name,
+#                     "boot_time": None,
+#                     "error": f"Invalid output format: {output}",
+#                 })
+            
+#             # Extract boot time (second part onwards)
+#             boot_time_str = parts[1].strip()
+            
+#             # Parse the boot time from Windows format (e.g., "3/12/2026 3:42:05 PM")
+#             # Try multiple formats
+#             boot_dt = None
+#             for fmt in ("%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+#                 try:
+#                     boot_dt = datetime.strptime(boot_time_str, fmt)
+#                     break
+#                 except ValueError:
+#                     continue
+            
+#             if boot_dt is None:
+#                 logger.warning(f"{server_name}: Could not parse boot time: {boot_time_str}")
+#                 return json.dumps({
+#                     "server": server_name,
+#                     "boot_time": None,
+#                     "error": f"Could not parse boot time format: {boot_time_str}",
+#                 })
+            
+#             # Format to standardized format: YYYY-MM-DD HH:MM:SS
+#             formatted_boot_time = boot_dt.strftime("%Y-%m-%d %H:%M:%S")
+            
+#             logger.info(f" {server_name}: boot time = {formatted_boot_time}")
+            
+#             return json.dumps({
+#                 "server": server_name,
+#                 "boot_time": formatted_boot_time,
+#                 "error": None,
+#             })
+    
+#     except TimeoutError:
+#         error_msg = f"Connection timeout to {server_name}"
+#         logger.error(error_msg)
 #         return json.dumps({
-#             "server":    server_name,
-#             "boot_time": "2026-03-12 15:42:05",
-#             "error":     None,
-#         })
-#     else:
-#         return json.dumps({
-#             "server":    server_name,
+#             "server": server_name,
 #             "boot_time": None,
-#             "error":     "Could not connect to server",
+#             "error": "Could not connect to server",
 #         })
-
-def get_server_boot_time(server_name: str) -> str:
-    """
-    Connect to *server_name* via WinRM and retrieve the last boot time.
     
-    Args:
-        server_name: Hostname or IP address of the Windows server
+#     except ConnectionError as e:
+#         error_msg = f"Connection refused: {str(e)}"
+#         logger.error(f"{server_name}: {error_msg}")
+#         return json.dumps({
+#             "server": server_name,
+#             "boot_time": None,
+#             "error": "Could not connect to server",
+#         })
     
-    Returns:
-        JSON string with server, boot_time, and error fields
-        Format: {"server": "...", "boot_time": "YYYY-MM-DD HH:MM:SS", "error": null/str}
-    
-    Reads WinRM credentials from environment variables:
-        - WINRM_USER
-        - WINRM_PASSWORD
-        - WINRM_TRANSPORT (default: ntlm)
-    """
-    
-    try:
-        time.sleep(5)
-        if not WINRM_USER or not WINRM_PASSWORD:
-            logger.error(f"{server_name}: WINRM_USER or WINRM_PASSWORD not set in environment")
-            return json.dumps({
-                "server": server_name,
-                "boot_time": None,
-                "error": "WinRM credentials not configured (WINRM_USER, WINRM_PASSWORD)",
-            })
-        
-        logger.info(f"Connecting to {server_name}...")
-        if "cranckb" in server_name:
-            # Create WinRM session using winrm.Session
-            session = winrm.Session(
-                server_name,
-                auth=(WINRM_USER, WINRM_PASSWORD),
-                transport=WINRM_TRANSPORT,
-            )
-        else:
-            session = winrm.Session(
-                server_name,
-                auth=("azure-server\\subhayan", WINRM_PASSWORD),
-                transport=WINRM_TRANSPORT,
-            )
-        
-        # Run PowerShell command to get boot time and computer name
-        ps_cmd = (
-            "(Get-CimInstance -ClassName Win32_OperatingSystem | "
-            "ForEach-Object { $_.CSName + ' ' + $_.LastBootUpTime })"
-        )
-        
-        response = session.run_ps(ps_cmd)
-        
-        # Check for command execution errors
-        if response.status_code != 0:
-            error_msg = response.std_err.decode("utf-8", errors="ignore").strip()
-            if not error_msg:
-                error_msg = "Unknown error"
-            logger.warning(f"PowerShell error on {server_name}: {error_msg}")
-            return json.dumps({
-                "server": server_name,
-                "boot_time": None,
-                "error": f"PowerShell command failed: {error_msg}",
-            })
-        
-        # Parse output: format is "COMPUTERNAME 3/12/2026 3:42:05 PM"
-        output = response.std_out.decode("utf-8", errors="ignore").strip()
-        
-        if not output:
-            logger.warning(f"{server_name}: No output from PowerShell command")
-            return json.dumps({
-                "server": server_name,
-                "boot_time": None,
-                "error": "No output from PowerShell command",
-            })
-        
-        # Split output: first part is computer name, rest is the datetime
-        parts = output.split(maxsplit=1)
-        if len(parts) < 2:
-            logger.warning(f"{server_name}: Invalid output format: {output}")
-            return json.dumps({
-                "server": server_name,
-                "boot_time": None,
-                "error": f"Invalid output format: {output}",
-            })
-        
-        # Extract boot time (second part onwards)
-        boot_time_str = parts[1].strip()
-        
-        # Parse the boot time from Windows format (e.g., "3/12/2026 3:42:05 PM")
-        # Try multiple formats
-        boot_dt = None
-        for fmt in ("%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
-            try:
-                boot_dt = datetime.strptime(boot_time_str, fmt)
-                break
-            except ValueError:
-                continue
-        
-        if boot_dt is None:
-            logger.warning(f"{server_name}: Could not parse boot time: {boot_time_str}")
-            return json.dumps({
-                "server": server_name,
-                "boot_time": None,
-                "error": f"Could not parse boot time format: {boot_time_str}",
-            })
-        
-        # Format to standardized format: YYYY-MM-DD HH:MM:SS
-        formatted_boot_time = boot_dt.strftime("%Y-%m-%d %H:%M:%S")
-        
-        logger.info(f" {server_name}: boot time = {formatted_boot_time}")
-        
-        return json.dumps({
-            "server": server_name,
-            "boot_time": formatted_boot_time,
-            "error": None,
-        })
-    
-    except TimeoutError:
-        error_msg = f"Connection timeout to {server_name}"
-        logger.error(error_msg)
-        return json.dumps({
-            "server": server_name,
-            "boot_time": None,
-            "error": "Could not connect to server",
-        })
-    
-    except ConnectionError as e:
-        error_msg = f"Connection refused: {str(e)}"
-        logger.error(f"{server_name}: {error_msg}")
-        return json.dumps({
-            "server": server_name,
-            "boot_time": None,
-            "error": "Could not connect to server",
-        })
-    
-    except Exception as e:
-        error_msg = f"WinRM error: {str(e)}"
-        logger.error(f"{server_name}: {error_msg}")
-        return json.dumps({
-            "server": server_name,
-            "boot_time": None,
-            "error": "Could not connect to server",
-        })
+#     except Exception as e:
+#         error_msg = f"WinRM error: {str(e)}"
+#         logger.error(f"{server_name}: {error_msg}")
+#         return json.dumps({
+#             "server": server_name,
+#             "boot_time": None,
+#             "error": "Could not connect to server",
+#         })
  
 
-
-def update_boot_time_in_excel(
-    server_name: str,
-    boot_time: str | None = None,
-    error: str | None = None,
-) -> str:
+def get_server_boot_time() -> str:
     """
-    Write *boot_time* (and *error*) into the master Excel for *server_name*.
+    Reads lyric servers with Implementation Status 'Completed' from the master
+    Excel, connects to each via WinRM, and retrieves the last boot time.
+    Returns a list of results — one entry per server.
+    """
+    if not os.path.exists(MASTER_PATH):
+        return json.dumps({"error": f"Master Excel not found at {MASTER_PATH}"})
 
-    Rules
-    -----
-    1. If the server row already has a non-empty Boot Time  → SKIP entirely.
-       This protects data written by a previous implementation-status e-mail.
-    2. If the server row exists but Boot Time is empty/null → write the new value.
-    3. If the server is NOT found in the master Excel at all → append a new row
-       so that data from every e-mail is captured without losing earlier entries.
+    if not WINRM_USER or not WINRM_PASSWORD:
+        return json.dumps({"error": "WinRM credentials not configured"})
 
-    Duplicate servers across e-mails
-    ---------------------------------
-    Servers should not appear in more than one e-mail, but if they do the LATEST
-    value wins: the agent processes e-mails in chronological order; on the second
-    occurrence the Boot Time cell will already be populated (from the first mail),
-    so the skip guard fires.  To force an overwrite with the latest value the
-    caller should clear the cell first, or the orchestrator should pre-clear it
-    before processing a newer mail for the same server.
+    # --- Pull server list from Excel ---
+    try:
+        df = pd.read_excel(MASTER_PATH)
+        df.columns = df.columns.str.strip()
+
+        ready_df = df[
+            df["Application Name"].str.contains("lyric", case=False, na=False)
+            & (df["Implementation Status"].str.strip().str.lower() == "completed")
+        ]
+
+        server_names = ready_df["Server Name"].dropna().str.strip().tolist()
+    except Exception as e:
+        return json.dumps({"error": f"Failed to read Excel: {e}"})
+
+    if not server_names:
+        return json.dumps({"count": 0, "results": [], "message": "No eligible servers found."})
+
+    # --- Loop and fetch boot times ---
+    results = []
+
+    for server_name in server_names:
+        try:
+            time.sleep(2)
+            logger.info(f"Connecting to {server_name}...")
+
+            if "cranckb" in server_name:
+                session = winrm.Session(
+                    server_name,
+                    auth=(WINRM_USER, WINRM_PASSWORD),
+                    transport=WINRM_TRANSPORT,
+                )
+            else:
+                session = winrm.Session(
+                    server_name,
+                    auth=("azure-server\\subhayan", WINRM_PASSWORD),
+                    transport=WINRM_TRANSPORT,
+                )
+
+            ps_cmd = (
+                "(Get-CimInstance -ClassName Win32_OperatingSystem | "
+                "ForEach-Object { $_.CSName + ' ' + $_.LastBootUpTime })"
+            )
+
+            response = session.run_ps(ps_cmd)
+
+            if response.status_code != 0:
+                error_msg = response.std_err.decode("utf-8", errors="ignore").strip()
+                results.append({
+                    "server": server_name,
+                    "boot_time": None,
+                    "error": f"PowerShell failed: {error_msg or 'Unknown'}",
+                })
+                continue
+
+            output = response.std_out.decode("utf-8", errors="ignore").strip()
+
+            if not output:
+                results.append({"server": server_name, "boot_time": None, "error": "No output"})
+                continue
+
+            parts = output.split(maxsplit=1)
+            if len(parts) < 2:
+                results.append({"server": server_name, "boot_time": None, "error": f"Invalid output: {output}"})
+                continue
+
+            boot_time_str = parts[1].strip()
+            boot_dt = None
+            for fmt in ("%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    boot_dt = datetime.strptime(boot_time_str, fmt)
+                    break
+                except ValueError:
+                    continue
+
+            if not boot_dt:
+                results.append({"server": server_name, "boot_time": None, "error": f"Parse failed: {boot_time_str}"})
+                continue
+
+            results.append({
+                "server": server_name,
+                "boot_time": boot_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "error": None,
+            })
+
+        except Exception:
+            results.append({"server": server_name, "boot_time": None, "error": "Could not connect to server"})
+
+    return json.dumps({"count": len(results), "results": results})
+
+def update_boot_time_in_excel(servers: list[dict]) -> str:
+    """
+    Write boot_time and/or error into the master Excel for a list of servers.
+
+    Each item in `servers` should be:
+        {"server_name": str, "boot_time": str | None, "error": str | None}
+
+    Rules per server:
+    1. Already has Boot Time or Error recorded → SKIP (preserves earlier data).
+    2. Exists but Boot Time is empty           → write the new value.
+    3. Not found in Excel                      → append a new row.
     """
     time.sleep(3)
     if not os.path.exists(MASTER_PATH):
         return json.dumps({"error": f"Master Excel not found at {MASTER_PATH}"})
+
+    results = []
 
     try:
         with _excel_lock:
             df = pd.read_excel(MASTER_PATH)
             df.columns = df.columns.str.strip()
             df = _ensure_columns(df, "Boot Time", "Error")
-
-            # Force object dtype so string error messages can be written without rejection
             df["Boot Time"] = df["Boot Time"].astype(object)
             df["Error"]     = df["Error"].astype(object)
 
-            mask = _server_mask(df, server_name)
+            for item in servers:
+                server_name = item.get("server", "").strip()
+                boot_time   = item.get("boot_time")
+                error       = item.get("error")
 
-            # ----------------------------------------------------------------
-            # Case A: server NOT in Excel → append a brand-new row
-            # ----------------------------------------------------------------
-            if not mask.any():
-                new_row = {col: None for col in df.columns}
-                new_row["Server Name"] = server_name
-                new_row["Boot Time"]   = boot_time
-                new_row["Error"]       = error
-                df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-                df.to_excel(MASTER_PATH, index=False)
-                return json.dumps({
-                    "status":    "added",
-                    "server":    server_name,
-                    "boot_time": boot_time,
-                    "error":     error,
-                })
+                if not server_name:
+                    results.append({"server": server_name, "status": "error", "reason": "Empty server name"})
+                    continue
 
-            # ----------------------------------------------------------------
-            # Case B: server found — check whether Boot Time is already set
-            # ----------------------------------------------------------------
-            existing_boot = df.loc[mask, "Boot Time"].iloc[0]
-            existing_error = df.loc[mask, "Error"].iloc[0]
+                mask = _server_mask(df, server_name)
 
-            if not _cell_is_empty(existing_boot) or not _cell_is_empty(existing_error):
-                # Either a boot time or an error was already recorded → do not overwrite
-                return json.dumps({
-                    "status": "skipped",
-                    "server": server_name,
-                    "reason": (
-                        f"Already recorded — Boot Time: '{existing_boot}', Error: '{existing_error}'. "
-                        "No overwrite performed — data from previous implementation mail is preserved."
-                    ),
-                })
+                # Case A: server NOT in Excel → append new row
+                if not mask.any():
+                    new_row = {col: None for col in df.columns}
+                    new_row["Server Name"] = server_name
+                    new_row["Boot Time"]   = boot_time
+                    new_row["Error"]       = error
+                    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                    # Recompute mask after concat
+                    mask = _server_mask(df, server_name)
+                    results.append({"server": server_name, "status": "added", "boot_time": boot_time, "error": error})
+                    continue
 
-            # ----------------------------------------------------------------
-            # Case C: server found, Boot Time is empty → safe to write
-            # ----------------------------------------------------------------
-            df.loc[mask, "Boot Time"] = boot_time
-            df.loc[mask, "Error"]     = error
+                # Case B: server found — check if already recorded
+                existing_boot  = df.loc[mask, "Boot Time"].iloc[0]
+                existing_error = df.loc[mask, "Error"].iloc[0]
+
+                if not _cell_is_empty(existing_boot) or not _cell_is_empty(existing_error):
+                    results.append({
+                        "server": server_name,
+                        "status": "skipped",
+                        "reason": f"Already recorded — Boot Time: '{existing_boot}', Error: '{existing_error}'.",
+                    })
+                    continue
+
+                # Case C: server found, Boot Time empty → safe to write
+                df.loc[mask, "Boot Time"] = boot_time
+                df.loc[mask, "Error"]     = error
+                results.append({"server": server_name, "status": "updated", "boot_time": boot_time, "error": error})
+
+            # Single write for the entire batch
             df.to_excel(MASTER_PATH, index=False)
-
-            return json.dumps({
-                "status":    "updated",
-                "server":    server_name,
-                "boot_time": boot_time,
-                "error":     error,
-            })
 
     except Exception as e:
         return json.dumps({"error": str(e)})
 
+    return json.dumps({"count": len(results), "results": results})
 
-def validate_boot_within_patch_window(server_name: str) -> str:
+
+def validate_boot_within_patch_window(server_names: list[str]) -> str:
     """
-    Check whether the server's stored Boot Time falls inside its Patch Window.
-    Updates 'Application Team Validation Status' column accordingly:
-      - 'Successful'  → boot time is within the patch window
-      - 'Failed'      → boot time is outside the patch window
-      - 'Unknown'     → missing/unparseable boot time or patch window
+    Batch validate whether each server's stored Boot Time falls inside its Patch Window.
+    Updates 'Application Team Validation Status' for all servers in a single Excel read/write.
 
-    Rules
-    -----
-    * If Application Team Validation Status is already set (non-empty) → SKIP.
-      This ensures data written by a previous e-mail run is never overwritten.
-    * If the server is not found → return an error (no row is added here because
-      validation depends on a Patch Window that only a pre-existing row can have).
+    Status values:
+      - 'Successful' → boot time within patch window
+      - 'Failed'     → boot time outside patch window OR no patch window defined
+      - 'Unknown'    → boot time missing/unparseable OR patch window unparseable
+    
+    Skips servers where status is already recorded.
     """
     time.sleep(3)
     if not os.path.exists(MASTER_PATH):
         return json.dumps({"error": f"Master Excel not found at {MASTER_PATH}"})
+
+    results = []
 
     try:
         with _excel_lock:
@@ -537,90 +599,89 @@ def validate_boot_within_patch_window(server_name: str) -> str:
             df.columns = df.columns.str.strip()
             df = _ensure_columns(df, "Application Team Validation Status")
 
-            mask = _server_mask(df, server_name)
+            for server_name in server_names:
+                mask = _server_mask(df, server_name)
 
-            if not mask.any():
-                return json.dumps({"error": f"Server '{server_name}' not found in Excel."})
+                if not mask.any():
+                    results.append({
+                        "server": server_name,
+                        "status": "error",
+                        "reason": f"Server '{server_name}' not found in Excel.",
+                    })
+                    continue
 
-            row = df[mask].iloc[0]
+                row = df[mask].iloc[0]
 
-            # ----------------------------------------------------------------
-            # Skip if validation status already recorded
-            # ----------------------------------------------------------------
-            existing_status = row.get("Application Team Validation Status")
-            if not _cell_is_empty(existing_status):
-                return json.dumps({
-                    "status": "skipped",
-                    "server": server_name,
-                    "reason": (
-                        f"Validation Status already recorded as '{existing_status}'. "
-                        "No overwrite performed — data from previous "
-                        "implementation mail is preserved."
-                    ),
+                # Skip if already recorded
+                existing_status = row.get("Application Team Validation Status")
+                if not _cell_is_empty(existing_status):
+                    results.append({
+                        "server": server_name,
+                        "status": "skipped",
+                        "reason": f"Already recorded as '{existing_status}'.",
+                    })
+                    continue
+
+                # Parse boot time
+                boot_time_raw = row.get("Boot Time")
+                patch_window  = row.get("Patch Window")
+
+                boot_dt = None
+                if not _cell_is_empty(boot_time_raw):
+                    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d-%b-%Y %H:%M"):
+                        try:
+                            boot_dt = datetime.strptime(str(boot_time_raw).strip(), fmt)
+                            break
+                        except ValueError:
+                            continue
+
+                if boot_dt is None:
+                    df.loc[mask, "Application Team Validation Status"] = "Unknown"
+                    results.append({
+                        "server": server_name,
+                        "status": "Unknown",
+                        "reason": "Boot time is missing or could not be parsed.",
+                    })
+                    continue
+
+                # Parse patch window
+                start_dt, end_dt = _parse_patch_window(patch_window, reference_date=boot_dt)
+
+                if start_dt is None:
+                    df.loc[mask, "Application Team Validation Status"] = "Unknown"
+                    results.append({
+                        "server": server_name,
+                        "status": "Unknown",
+                        "reason": f"Patch window '{patch_window}' could not be parsed.",
+                    })
+                    continue
+
+                within            = start_dt <= boot_dt <= end_dt
+                validation_status = "Successful" if within else "Failed"
+
+                df.loc[mask, "Application Team Validation Status"] = validation_status
+                results.append({
+                    "server":       server_name,
+                    "status":       validation_status,
+                    "boot_time":    str(boot_dt),
+                    "patch_window": f"{start_dt} → {end_dt}",
+                    "within_window": within,
                 })
 
-            # ----------------------------------------------------------------
-            # Parse boot time
-            # ----------------------------------------------------------------
-            boot_time_raw = row.get("Boot Time")
-            patch_window  = row.get("Patch Window")
-
-            boot_dt = None
-            if not _cell_is_empty(boot_time_raw):
-                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d-%b-%Y %H:%M"):
-                    try:
-                        boot_dt = datetime.strptime(str(boot_time_raw).strip(), fmt)
-                        break
-                    except ValueError:
-                        continue
-
-            if boot_dt is None:
-                df.loc[mask, "Application Team Validation Status"] = "Unknown"
-                df.to_excel(MASTER_PATH, index=False)
-                return json.dumps({
-                    "server": server_name,
-                    "status": "Unknown",
-                    "reason": "Boot time is missing or could not be parsed.",
-                })
-
-            # ----------------------------------------------------------------
-            # Parse patch window and determine result
-            # ----------------------------------------------------------------
-            start_dt, end_dt = _parse_patch_window(patch_window, reference_date=boot_dt)
-
-            if start_dt is None:
-                df.loc[mask, "Application Team Validation Status"] = "Unknown"
-                df.to_excel(MASTER_PATH, index=False)
-                return json.dumps({
-                    "server": server_name,
-                    "status": "Unknown",
-                    "reason": f"Patch window '{patch_window}' could not be parsed.",
-                })
-
-            within            = start_dt <= boot_dt <= end_dt
-            validation_status = "Successful" if within else "Failed"
-
-            df.loc[mask, "Application Team Validation Status"] = validation_status
+            # Single write for entire batch
             df.to_excel(MASTER_PATH, index=False)
-
-            return json.dumps({
-                "server":        server_name,
-                "boot_time":     str(boot_dt),
-                "patch_window":  f"{start_dt} → {end_dt}",
-                "within_window": within,
-                "status":        validation_status,
-            })
 
     except Exception as e:
         return json.dumps({"error": str(e)})
 
+    return json.dumps({"count": len(results), "results": results})
 
 # ---------------------------------------------------------------------------
 # 5. TOOL_FUNCTIONS registry
 # ---------------------------------------------------------------------------
 
 TOOL_FUNCTIONS: dict[str, callable] = {
-    "get_lyric_servers_ready_for_validation": get_lyric_servers_ready_for_validation,
+    # "get_lyric_servers_ready_for_validation": get_lyric_servers_ready_for_validation,
     "get_server_boot_time":                   get_server_boot_time,
     "update_boot_time_in_excel":              update_boot_time_in_excel,
     "validate_boot_within_patch_window":      validate_boot_within_patch_window,
@@ -632,70 +693,73 @@ TOOL_FUNCTIONS: dict[str, callable] = {
 # ---------------------------------------------------------------------------
 
 TOOL_SCHEMAS: list[dict] = [
+    # {
+    #     "type": "function",
+    #     "function": {
+    #         "name": "get_lyric_servers_ready_for_validation",
+    #         "description": (
+    #             "Return only lyric application servers where Implementation Status is 'Completed'. "
+    #             "Always use this when fetching boot times or running validation — "
+    #             "servers that are not Completed should be skipped."
+    #         ),
+    #         "parameters": {
+    #             "type":       "object",
+    #             "properties": {},
+    #         },
+    #     },
+    # },
     {
-        "type": "function",
-        "function": {
-            "name": "get_lyric_servers_ready_for_validation",
-            "description": (
-                "Return only lyric application servers where Implementation Status is 'Completed'. "
-                "Always use this when fetching boot times or running validation — "
-                "servers that are not Completed should be skipped."
-            ),
-            "parameters": {
-                "type":       "object",
-                "properties": {},
+    "type": "function",
+    "function": {
+        "name": "get_server_boot_time",
+        "description": (
+            "Reads all lyric servers with Implementation Status 'Completed' directly "
+            "from the master Excel, connects to each via WinRM, and retrieves the last "
+            "boot time. No parameters needed — server discovery is handled internally."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},  # No parameters
             },
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "get_server_boot_time",
-            "description": (
-                "Connect to a Windows server via WinRM and retrieve its last "
-                "boot time (Win32_OperatingSystem.LastBootUpTime). "
-                "Returns the boot time as 'YYYY-MM-DD HH:MM:SS'."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "server_name": {
-                        "type":        "string",
-                        "description": "Hostname or IP address of the target Windows server.",
+    "type": "function",
+    "function": {
+        "name": "update_boot_time_in_excel",
+        "description": (
+            "Write boot time and/or error into the master Excel for a batch of servers "
+            "in a single call. SKIPS servers where Boot Time is already recorded. "
+            "Appends a new row for servers not found in Excel. "
+            "Pass boot_time=null and error=<message> for servers where WinRM failed."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "servers": {
+                    "type": "array",
+                    "description": "List of servers to update.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "server": {
+                                "type": "string",
+                                "description": "Exact server name as it appears in Excel.",
+                            },
+                            "boot_time": {
+                                "anyOf": [{"type": "string"}, {"type": "null"}],
+                                "description": "Boot time e.g. '2026-03-12 15:42:05', or null if unavailable.",
+                            },
+                            "error": {
+                                "anyOf": [{"type": "string"}, {"type": "null"}],
+                                "description": "Error message if WinRM failed, or null if successful.",
+                            },
+                        },
+                        "required": ["server"],
+                        },
                     }
                 },
-                "required": ["server_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "update_boot_time_in_excel",
-            "description": (
-                "Write boot time and/or error into the master Excel for a server. "
-                "SKIPS the update if Boot Time is already recorded (preserves data "
-                "from earlier implementation mails). Appends a new row if the server "
-                "is not found. Pass boot_time=null and error=<message> when the "
-                "WinRM connection failed."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "server_name": {
-                        "type":        "string",
-                        "description": "Exact server name as it appears in Excel.",
-                    },
-                    "boot_time": {
-                        "anyOf":       [{"type": "string"}, {"type": "null"}],
-                        "description": "Boot time string e.g. '2026-03-12 15:42:05', or null if unavailable.",
-                    },
-                    "error": {
-                        "anyOf":       [{"type": "string"}, {"type": "null"}],
-                        "description": "Error message if boot time could not be fetched, or null if successful.",
-                    },
-                },
-                "required": ["server_name"],
+                "required": ["servers"],
             },
         },
     },
@@ -704,21 +768,22 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "validate_boot_within_patch_window",
             "description": (
-                "Check whether the server's Boot Time (already stored in Excel) "
-                "falls inside its Patch Window. "
+                "Batch validate whether each server's Boot Time (already stored in Excel) "
+                "falls inside its Patch Window. Pass ALL server names at once. "
                 "Sets 'Application Team Validation Status' to 'Successful', 'Failed', or 'Unknown' "
-                "and saves the result back to the master Excel. "
-                "SKIPS if the status is already recorded (preserves data from earlier mails)."
+                "for each server in a single Excel read/write. "
+                "SKIPS servers where status is already recorded."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "server_name": {
-                        "type":        "string",
-                        "description": "Exact server name as it appears in the Excel.",
+                    "server_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of exact server names as they appear in Excel.",
                     }
                 },
-                "required": ["server_name"],
+                "required": ["server_names"],
             },
         },
     },

@@ -2,16 +2,6 @@
 validation_agent.py
 -------------------
 Core agent loop powered by Groq (openai/gpt-oss-120b).
-
-Responsibilities:
-    - Expose run_agent(user_query) — the primary public interface
-    - Drive the Groq function-calling loop until no more tool calls remain
-    - Dispatch tool calls to TOOL_FUNCTIONS in validation_tool.py
-    - Stream the final response token-by-token to stdout (optional)
-
-Usage:
-    from validation_agent import run_agent, run_predefined
-    answer = run_agent("Fetch boot times and validate all lyric servers")
 """
 
 from __future__ import annotations
@@ -28,7 +18,7 @@ from validation_tool import TOOL_FUNCTIONS, TOOL_SCHEMAS, MASTER_PATH, WINRM_USE
 
 load_dotenv()
 logger = logging.getLogger(__name__)
-TOOL_CALL_DELAY_SECONDS: int = int(os.environ.get("TOOL_CALL_DELAY", "1"))
+TOOL_CALL_DELAY_SECONDS: int = int(os.environ.get("TOOL_CALL_DELAY", "6"))
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -39,27 +29,30 @@ GPT_MODEL:    str = os.environ.get("GPT_MODEL", "openai/gpt-oss-120b")
 
 PROMPTS_DIR  : Path = Path(__file__).parent / "prompts" / "Validation Prompt"
 
-# Groq client — single instance
 _groq_client: Groq = Groq(api_key=GROQ_API_KEY)
 
-# ---------------------------------------------------------------------------
-# System prompt
-# ---------------------------------------------------------------------------
-
 SYSTEM_PROMPT: str = (
-    "You are a Patch Validation Agent. Your job is to:\n"
-    "1. Read lyric application servers from the master Excel.\n"
-    "2. Connect to each server via WinRM and fetch its last boot time.\n"
-    "3. Write the boot time into the master Excel ('Boot Time' column).\n"
-    "4. Validate whether the boot time falls within the server's Patch Window.\n"
-    "5. Update 'Application Team Validation Status' as 'Successful' or 'Failed'.\n\n"
-    "Always use the provided tools — never guess server data.\n"
-    "Process servers STRICTLY one at a time in this exact sequence for each server:\n"
-    "  get_server_boot_time → update_boot_time_in_excel → validate_boot_within_patch_window\n"
-    "Complete all three steps for one server before moving to the next.\n"
-    "Do NOT batch multiple servers in a single tool-call round.\n"
-    "Be concise and professional."
+    "You are a Patch Validation Agent for Lyric application servers.\n\n"
+    "TOOL EXECUTION ORDER — follow exactly:\n"
+    "  Step 1: get_server_boot_time()\n"
+    "          Single batch call. Fetches all Completed Lyric servers from Excel\n"
+    "          and retrieves boot times via WinRM. Call once per run.\n"
+    "  Step 2: update_boot_time_in_excel(servers=[...all results...])\n"
+    "          Single batch call. Pass ALL results from Step 1 at once.\n"
+    "  Step 3: validate_boot_within_patch_window(server_name)\n"
+    "          Call once per server — INCLUDING servers where WinRM failed.\n"
+    "          NEVER skip this step. Every server must be validated.\n\n"
+    "RULES:\n"
+    "  - Never guess or invent boot times or validation status.\n"
+    "  - Never skip a server — every server must have a recorded outcome.\n"
+    "  - WinRM failure → pass boot_time=null, error='Could not connect to server' to Step 2,\n"
+    "    then STILL call validate_boot_within_patch_window for that server in Step 3.\n"
+    "  - Only write to 'Boot Time' and 'Application Team Validation Status' columns.\n"
+    "  - Scope: Lyric servers only. Read-only WinRM — never modify servers.\n"
+    "  - Validation status values: 'Successful', 'Failed', or 'Unknown' only.\n\n"
+    "Be concise and professional. Report outcomes only — no narration of steps."
 )
+
 # ---------------------------------------------------------------------------
 # Predefined prompts
 # ---------------------------------------------------------------------------
@@ -81,127 +74,59 @@ PREDEFINED_PROMPTS: dict[str, str] = {
     ),
 }
 
+# ---------------------------------------------------------------------------
+# Prompt loading
+# ---------------------------------------------------------------------------
+
 def _load_prompt(filename: str) -> str:
-    """
-    Read a prompt file from the prompts/ directory.
-
-    Args:
-        filename: File name (e.g. 'system_prompt.txt').
-
-    Returns:
-        File contents as a stripped string.
-
-    Raises:
-        FileNotFoundError: If the file does not exist.
-    """
     path = PROMPTS_DIR / filename
     if not path.exists():
         raise FileNotFoundError(f"Prompt file not found: {path}")
-    content = path.read_text(encoding="utf-8").strip()
-    logger.debug("Loaded prompt: %s (%d chars)", filename, len(content))
-    return content
+    return path.read_text(encoding="utf-8").strip()
 
 
 def load_prompts() -> dict[str, str]:
-    """
-    Load all prompt files and return them as a dict.
-
-    Returns:
-        {
-            "system":    contents of system_prompt.txt,
-            "developer": contents of developer_prompt.txt,
-            "response":  contents of response_prompt.txt,
-        }
-    """
-    prompts = {
+    return {
         "system":    _load_prompt("system_prompt"),
         "developer": _load_prompt("developer_prompt"),
         "response":  _load_prompt("response_prompt"),
     }
-    logger.info("All prompts loaded successfully.")
-    return prompts
 
 
-def reload_prompts() -> dict[str, str]:
-    """
-    Hot-reload all prompts from disk without restarting the process.
-    Useful during prompt tuning or called from an admin endpoint.
-
-    Returns:
-        Fresh prompt dict.
-    """
-    logger.info("Hot-reloading prompts…")
-    global _PROMPTS
-    _PROMPTS = load_prompts()
-    return _PROMPTS
-
-
-# Load prompts once at module import time
 _PROMPTS: dict[str, str] = load_prompts()
 
 
-
 def _build_system_message() -> str:
-    """
-    Combine system, developer, and response prompts into a single
-    system message string for the Groq API.
-
-    Returns:
-        Combined prompt string.
-    """
     return "\n\n---\n\n".join([
         _PROMPTS["system"],
         _PROMPTS["developer"],
         _PROMPTS["response"],
     ])
 
-
-
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Tool dispatcher
 # ---------------------------------------------------------------------------
 
 def _dispatch_tool_call(tool_name: str, tool_args: dict) -> str:
-    """
-    Look up and execute a tool by name.
-
-    Args:
-        tool_name: The function name the model requested.
-        tool_args: Parsed argument dict from the model.
-
-    Returns:
-        JSON string result from the tool function.
-    """
     func = TOOL_FUNCTIONS.get(tool_name)
 
     if func is None:
-        logger.warning("Unknown tool requested: %s", tool_name)
         return json.dumps({"error": f"Unknown tool: '{tool_name}'"})
 
     try:
-        logger.info("  [Tool] %s(%s)", tool_name, tool_args)
-        result  = func(**tool_args)
-        preview = result[:200] + ("…" if len(result) > 200 else "")
-        logger.info("  [Result] %s", preview)
+        logger.info("[Tool] %s(%s)", tool_name, tool_args)
+        result = func(**tool_args)
+        logger.info("[Result] %s", result[:200])
         return result
-    except TypeError as exc:
-        logger.error("Tool call %s failed with bad arguments: %s", tool_name, exc)
-        return json.dumps({"error": f"Invalid arguments for {tool_name}: {exc}"})
     except Exception as exc:
-        logger.error("Tool call %s raised unexpected error: %s", tool_name, exc)
-        return json.dumps({"error": f"Tool '{tool_name}' failed: {exc}"})
+        logger.error("Tool error: %s", exc)
+        return json.dumps({"error": str(exc)})
 
+# ---------------------------------------------------------------------------
+# Streaming helper
+# ---------------------------------------------------------------------------
 
 def _stream_final_response(stream) -> str:
-    """
-    Consume a streaming Groq response, printing tokens as they arrive.
-
-    Args:
-        stream: Groq streaming completion object.
-
-    Returns:
-        The complete assembled response text.
-    """
     full_text = ""
     for chunk in stream:
         delta = chunk.choices[0].delta
@@ -209,66 +134,51 @@ def _stream_final_response(stream) -> str:
         if token:
             print(token, end="", flush=True)
             full_text += token
-    print()  # newline after streaming completes
+    print()
     return full_text
-
 
 # ---------------------------------------------------------------------------
 # Agent loop
 # ---------------------------------------------------------------------------
 
 def run_agent(user_query: str, stream: bool = True) -> str:
-    """
-    Run the Groq agent loop for a single user query.
-
-    The loop continues until the model stops requesting tool calls,
-    at which point the final text response is returned.
-
-    Args:
-        user_query: Natural language question or instruction from the user.
-        stream:     If True, stream the final response tokens to stdout.
-
-    Returns:
-        The agent's final text response.
-    """
     logger.info("User: %s", user_query)
 
     messages: list[dict] = [
         {"role": "system", "content": _build_system_message()},
         {"role": "user",   "content": user_query},
     ]
-
     while True:
-        time.sleep(1.5) 
+        time.sleep(6)
+
         response = _groq_client.chat.completions.create(
-            model                 = GPT_MODEL,
-            messages              = messages,
-            tools                 = TOOL_SCHEMAS,
-            tool_choice           = "auto",
-            temperature           = 1,
-            max_completion_tokens = 8192,
-            top_p                 = 1,
-            reasoning_effort      = "medium",
-            stream                = False,   # stream=False during tool-call phase
+            model=GPT_MODEL,
+            messages=messages,
+            tools=TOOL_SCHEMAS,
+            tool_choice="auto",
+            temperature=1,
+            max_completion_tokens=8192,
+            top_p=1,
+            reasoning_effort="medium",
+            stream=False,
         )
 
-        message    = response.choices[0].message
+        message = response.choices[0].message
         tool_calls = message.tool_calls or []
 
-        # No tool calls → model is ready to produce its final answer
         if not tool_calls:
             break
 
-        # Append the model's assistant turn (with tool_calls) to history
+        # Append assistant message
         messages.append({
-            "role":       "assistant",
-            "content":    message.content or "",
+            "role": "assistant",
+            "content": message.content or "",
             "tool_calls": [
                 {
-                    "id":       tc.id,
-                    "type":     "function",
+                    "id": tc.id,
+                    "type": "function",
                     "function": {
-                        "name":      tc.function.name,
+                        "name": tc.function.name,
                         "arguments": tc.function.arguments,
                     },
                 }
@@ -276,70 +186,72 @@ def run_agent(user_query: str, stream: bool = True) -> str:
             ],
         })
 
-        # Execute each tool and append results
+        # Execute tool calls
         for tc in tool_calls:
             try:
-                args = json.loads(tc.function.arguments)
+                arg_str = tc.function.arguments or "{}"
+                arg_str = arg_str.strip() if isinstance(arg_str, str) else "{}"
+                args = json.loads(arg_str)
+                if not isinstance(args, dict):
+                    args = {}
             except json.JSONDecodeError:
+                logger.warning("Bad JSON args for %s", tc.function.name)
                 args = {}
 
             result = _dispatch_tool_call(tc.function.name, args)
 
-                 # for tc in tool_calls:
-        #     try:
-        #         arg_str = tc.function.arguments or "{}"
-        #         if isinstance(arg_str, str):
-        #             arg_str = arg_str.strip()
-        #             if not arg_str:
-        #                 arg_str = "{}"
-        #         args = json.loads(arg_str)
-        #         if not isinstance(args, dict):
-        #             args = {}
-        #         args = {k: v for k, v in args.items() if isinstance(k, str) and k.strip()}
-        #     except json.JSONDecodeError as e:
-        #         logger.warning("Failed to parse arguments for %s: %s", 
-        #                     tc.function.name, tc.function.arguments)
-        #         args = {}
+            # Try parsing batch response
+            try:
+                parsed = json.loads(result)
+            except:
+                parsed = {}
 
-        #     result = _dispatch_tool_call(tc.function.name, args)
-
+            # Batch handling for get_server_boot_time
             messages.append({
-                "role":         "tool",
-                "tool_call_id": tc.id,
-                "content":      result,
+            "role": "tool",
+            "tool_call_id": tc.id,
+            "content": result,
             })
+
+            # Log batch size if applicable
+            if (
+                tc.function.name == "get_server_boot_time"
+                and isinstance(parsed, dict)
+                and isinstance(parsed.get("results"), list)
+            ):
+                logger.info("Boot time batch returned %d results", len(parsed["results"]))
+
+
             time.sleep(TOOL_CALL_DELAY_SECONDS)
 
-    # ---- Final response ----------------------------------------------------
+    # Final response
     if stream:
         final_stream = _groq_client.chat.completions.create(
-            model                 = GPT_MODEL,
-            messages              = messages,
-            tools                 = TOOL_SCHEMAS,
-            tool_choice           = "auto",   
-            temperature           = 0.7,
-            max_completion_tokens = 8192,
-            top_p                 = 0.5,
-            reasoning_effort      = "medium",
-            stream                = True,
+            model=GPT_MODEL,
+            messages=messages,
+            tools=TOOL_SCHEMAS,
+            tool_choice="auto",
+            temperature=1,
+            max_completion_tokens=8192,
+            top_p=1,
+            reasoning_effort="medium",
+            stream=True,
         )
         return _stream_final_response(final_stream)
 
-    # Non-streaming fallback
     final_response = _groq_client.chat.completions.create(
-        model                 = GPT_MODEL,
-        messages              = messages,
-        tools                 = TOOL_SCHEMAS,
-        tool_choice           = "auto",   
-        temperature           = 1,
-        max_completion_tokens = 8192,
-        top_p                 = 1,
-        reasoning_effort      = "medium",
-        stream                = False,
+        model=GPT_MODEL,
+        messages=messages,
+        tools=TOOL_SCHEMAS,
+        tool_choice="auto",
+        temperature=1,
+        max_completion_tokens=8192,
+        top_p=1,
+        reasoning_effort="medium",
+        stream=False,
     )
-    answer = final_response.choices[0].message.content or ""
-    logger.info("Agent response (%d chars)", len(answer))
-    return answer
+
+    return final_response.choices[0].message.content or ""
 
 
 def run_predefined(prompt_key: str, stream: bool = True) -> str:
